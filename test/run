@@ -6,14 +6,16 @@ docker build -t toxchat/toxic:test -f test/Dockerfile .
 if [ -t 1 ]; then
   docker run \
     --volume "$PWD/test:/build/toxic/test" \
-    --tmpfs /build/toxic/test/.tui-test \
+    --tmpfs /build/toxic/test/__pycache__ \
+    --hostname toxic-test.tox.chat \
     --rm \
     -it \
     toxchat/toxic:test "$@"
 else
   docker run \
     --volume "$PWD/test:/build/toxic/test" \
-    --tmpfs /build/toxic/test/.tui-test \
+    --tmpfs /build/toxic/test/__pycache__ \
+    --hostname toxic-test.tox.chat \
     --rm \
     toxchat/toxic:test "$@"
 fi

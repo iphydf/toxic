@@ -15,12 +15,9 @@ RUN ["apk", "add", "--no-cache", \
  "ncurses-dev", \
  "opus-dev", \
  "pkgconfig", \
+ "python3", \
  "samurai", \
- "yarn"]
-
-WORKDIR /build
-RUN yarn add --dev @microsoft/tui-test
-ENV PATH=$PATH:/build/node_modules/.bin
+ "tmux"]
 
 WORKDIR /build
 RUN git clone --depth=1 --recursive https://github.com/TokTok/c-toxcore /build/c-toxcore \
@@ -40,4 +37,4 @@ ENV CFLAGS="-D_GNU_SOURCE -Werror"
 RUN make "-j$(nproc)" install
 
 WORKDIR /build/toxic/test
-ENTRYPOINT ["tui-test"]
+ENTRYPOINT ["./unittest"]
