@@ -13,9 +13,23 @@
 
 #include <vpx/vpx_image.h>
 
+/* Cameras come from V4L2, or from the backend that the camera_* macros map to. */
 #if defined(__OSX__) || defined(__APPLE__)
 #import "osx_video.h"
+#define camera_init osx_video_init
+#define camera_release osx_video_release
+#define camera_open osx_video_open_device
+#define camera_close osx_video_close_device
+#define camera_read osx_video_read_device
+#elif defined(__ANDROID__)
+#include "android_video.h"
+#define camera_init android_video_init
+#define camera_release android_video_release
+#define camera_open android_video_open_device
+#define camera_close android_video_close_device
+#define camera_read android_video_read_device
 #else
+#define USE_V4L2
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -29,6 +43,11 @@
 #include <linux/videodev2.h>
 #endif /* defined(__OpenBSD__) || defined(__NetBSD__) */
 #endif /* __OSX__ || __APPLE__ */
+
+/* Video is shown in X11 windows, except on Android, where the app shows it. */
+#ifndef __ANDROID__
+#define USE_X11
+#endif
 
 #include "line_info.h"
 #include "misc_tools.h"
@@ -53,7 +72,7 @@ typedef struct VideoDevice {
     void *cb_data;                          /* Data to be passed to callback */
     int32_t friend_number;                  /* ToxAV friend number */
 
-#if !(defined(__OSX__) || defined(__APPLE__))
+#ifdef USE_V4L2
     int fd;                                 /* File descriptor of video device selected/opened */
     struct v4l2_format fmt;
     struct VideoBuffer *buffers;
@@ -68,9 +87,11 @@ typedef struct VideoDevice {
 
     vpx_image_t input;
 
+#ifdef USE_X11
     Display *x_display;
     Window x_window;
     GC x_gc;
+#endif /* USE_X11 */
 
 } VideoDevice;
 
@@ -118,7 +139,7 @@ static void yuv420tobgr(uint16_t width, uint16_t height, const uint8_t *y,
     }
 }
 
-#if !(defined(__OSX__) || defined(__APPLE__))
+#ifdef USE_V4L2
 static void yuv422to420(uint8_t *plane_y, uint8_t *plane_u, uint8_t *plane_v,
                         uint8_t *f_input, uint16_t width, uint16_t height)
 {
@@ -156,19 +177,142 @@ static int xioctl(int fh, unsigned long request, void *arg)
     return r;
 }
 
-#endif
+#endif /* USE_V4L2 */
+
+#ifdef USE_X11
+static bool video_window_open(VideoDevice *device, VideoDeviceType type, const char *title)
+{
+    UNUSED_VAR(type);
+
+    if ((device->x_display = XOpenDisplay(NULL)) == NULL) {
+        return false;
+    }
+
+    int screen = DefaultScreen(device->x_display);
+    const uint16_t width = type == vdt_input ? device->video_width : 100;
+    const uint16_t height = type == vdt_input ? device->video_height : 100;
+
+    if (!(device->x_window = XCreateSimpleWindow(device->x_display, RootWindow(device->x_display, screen), 0, 0,
+                             width, height, 0, BlackPixel(device->x_display, screen),
+                             BlackPixel(device->x_display, screen)))) {
+        return false;
+    }
+
+    XStoreName(device->x_display, device->x_window, title);
+    XSelectInput(device->x_display, device->x_window, ExposureMask | ButtonPressMask | KeyPressMask);
+
+    if ((device->x_gc = DefaultGC(device->x_display, screen)) == NULL) {
+        return false;
+    }
+
+    /* Disable user from manually closing the X11 window */
+    Atom wm_delete_window = XInternAtom(device->x_display, "WM_DELETE_WINDOW", false);
+    XSetWMProtocols(device->x_display, device->x_window, &wm_delete_window, 1);
+
+    XMapWindow(device->x_display, device->x_window);
+    XClearWindow(device->x_display, device->x_window);
+    XMapRaised(device->x_display, device->x_window);
+    XFlush(device->x_display);
+    return true;
+}
+
+static void video_window_resize(VideoDevice *device, uint16_t width, uint16_t height)
+{
+    XResizeWindow(device->x_display, device->x_window, width, height);
+}
+
+/* bgra is width * height pixels from yuv420tobgr. */
+static void video_window_draw(VideoDevice *device, VideoDeviceType type, uint8_t *bgra, uint16_t width,
+                              uint16_t height)
+{
+    UNUSED_VAR(type);
+
+    /* Allocate image data in X11 */
+    XImage image = {
+        .width = width,
+        .height = height,
+        .depth = 24,
+        .bits_per_pixel = 32,
+        .format = ZPixmap,
+        .byte_order = LSBFirst,
+        .bitmap_unit = 8,
+        .bitmap_bit_order = LSBFirst,
+        .bytes_per_line = width * 4,
+        .red_mask = 0xFF0000,
+        .green_mask = 0xFF00,
+        .blue_mask = 0xFF,
+        .data = (char *)bgra
+    };
+
+    /* Render image data */
+    Pixmap pixmap = XCreatePixmap(device->x_display, device->x_window, width, height, 24);
+    XPutImage(device->x_display, pixmap, device->x_gc, &image, 0, 0, 0, 0, width, height);
+    XCopyArea(device->x_display, pixmap, device->x_window, device->x_gc, 0, 0, width, height, 0, 0);
+    XFreePixmap(device->x_display, pixmap);
+    XFlush(device->x_display);
+}
+
+static void video_window_close(VideoDevice *device, VideoDeviceType type)
+{
+    UNUSED_VAR(type);
+
+    if (device->x_display == NULL) {
+        return;
+    }
+
+    if (device->x_window) {
+        XDestroyWindow(device->x_display, device->x_window);
+    }
+
+    XFlush(device->x_display);
+    XCloseDisplay(device->x_display);
+}
+#else /* not USE_X11 */
+static Android_Video_Window android_window(VideoDeviceType type)
+{
+    return type == vdt_input ? ANDROID_VIDEO_PREVIEW : ANDROID_VIDEO_RECEIVE;
+}
+
+static bool video_window_open(VideoDevice *device, VideoDeviceType type, const char *title)
+{
+    UNUSED_VAR(device);
+    UNUSED_VAR(title);
+    android_video_window_open(android_window(type));
+    return true;
+}
+
+static void video_window_resize(VideoDevice *device, uint16_t width, uint16_t height)
+{
+    UNUSED_VAR(device);
+    UNUSED_VAR(width);
+    UNUSED_VAR(height);
+}
+
+static void video_window_draw(VideoDevice *device, VideoDeviceType type, uint8_t *bgra, uint16_t width,
+                              uint16_t height)
+{
+    UNUSED_VAR(device);
+    android_video_window_draw(android_window(type), bgra, width, height);
+}
+
+static void video_window_close(VideoDevice *device, VideoDeviceType type)
+{
+    UNUSED_VAR(device);
+    android_video_window_close(android_window(type));
+}
+#endif /* USE_X11 */
 
 VideoDeviceError init_video_devices(Toxic *toxic)
 {
     c_size[vdt_input] = 0;
 
-#if defined(__OSX__) || defined(__APPLE__)
+#ifndef USE_V4L2
 
-    if (osx_video_init(&video_devices_names[vdt_input][0], &c_size[vdt_input]) != 0) {
+    if (camera_init(&video_devices_names[vdt_input][0], &c_size[vdt_input]) != 0) {
         return vde_InternalError;
     }
 
-#else /* not __OSX__ || __APPLE__ */
+#else /* USE_V4L2 */
 
     for (; c_size[vdt_input] <= MAX_DEVICES; ++c_size[vdt_input]) {
         int fd;
@@ -259,9 +403,9 @@ VideoDeviceError terminate_video_devices(void)
         return (VideoDeviceError) vde_InternalError;
     }
 
-#if defined(__OSX__) || defined(__APPLE__)
-    osx_video_release();
-#endif /* __OSX__ || __APPLE__ */
+#ifndef USE_V4L2
+    camera_release();
+#endif /* USE_V4L2 */
 
     return (VideoDeviceError) vde_None;
 }
@@ -269,13 +413,13 @@ VideoDeviceError terminate_video_devices(void)
 VideoDeviceError register_video_device_callback(int32_t friend_number, uint32_t device_idx,
         VideoDataHandleCallback callback, void *data)
 {
-#if defined(__OSX__) || defined(__APPLE__)
+#ifndef USE_V4L2
 
     if (c_size[vdt_input] <= device_idx || !video_devices_running[vdt_input][device_idx]) {
         return vde_InvalidSelection;
     }
 
-#else /* not __OSX__ || __APPLE__ */
+#else /* USE_V4L2 */
 
     if (c_size[vdt_input] <= device_idx || !video_devices_running[vdt_input][device_idx]
             || !video_devices_running[vdt_input][device_idx]->fd) {
@@ -361,16 +505,17 @@ VideoDeviceError open_video_device(VideoDeviceType type, int32_t selection, uint
     if (type == vdt_input) {
         video_thread_paused = true;
 
-#if defined(__OSX__) || defined(__APPLE__)
+#ifndef USE_V4L2
 
         /* TODO: use requested resolution */
-        if (osx_video_open_device(selection, &device->video_width, &device->video_height) != 0) {
+        if (camera_open(selection, &device->video_width, &device->video_height) != 0) {
+            video_devices_running[type][temp_idx] = NULL;
             free(device);
             unlock;
             return vde_FailedStart;
         }
 
-#else /* not __OSX__ || __APPLE__ */
+#else /* USE_V4L2 */
         /* Open selected device */
         char device_address[MAX_STR_SIZE];
         snprintf(device_address, sizeof(device_address), "/dev/video%i", selection);
@@ -498,42 +643,13 @@ VideoDeviceError open_video_device(VideoDeviceType type, int32_t selection, uint
             return vde_FailedStart;
         }
 
-#endif
+#endif /* USE_V4L2 */
 
-        /* Create X11 window associated to device */
-        if ((device->x_display = XOpenDisplay(NULL)) == NULL) {
+        if (!video_window_open(device, vdt_input, "Video Preview")) {
             close_video_device(vdt_input, temp_idx);
             unlock;
             return vde_FailedStart;
         }
-
-        int screen = DefaultScreen(device->x_display);
-
-        if (!(device->x_window = XCreateSimpleWindow(device->x_display, RootWindow(device->x_display, screen), 0, 0,
-                                 device->video_width, device->video_height, 0, BlackPixel(device->x_display, screen),
-                                 BlackPixel(device->x_display, screen)))) {
-            close_video_device(vdt_input, temp_idx);
-            unlock;
-            return vde_FailedStart;
-        }
-
-        XStoreName(device->x_display, device->x_window, "Video Preview");
-        XSelectInput(device->x_display, device->x_window, ExposureMask | ButtonPressMask | KeyPressMask);
-
-        if ((device->x_gc = DefaultGC(device->x_display, screen)) == NULL) {
-            close_video_device(vdt_input, temp_idx);
-            unlock;
-            return vde_FailedStart;
-        }
-
-        /* Disable user from manually closing the X11 window */
-        Atom wm_delete_window = XInternAtom(device->x_display, "WM_DELETE_WINDOW", false);
-        XSetWMProtocols(device->x_display, device->x_window, &wm_delete_window, 1);
-
-        XMapWindow(device->x_display, device->x_window);
-        XClearWindow(device->x_display, device->x_window);
-        XMapRaised(device->x_display, device->x_window);
-        XFlush(device->x_display);
 
         vpx_img_alloc(&device->input, VPX_IMG_FMT_I420, device->video_width, device->video_height, 1);
 
@@ -548,39 +664,11 @@ VideoDeviceError open_video_device(VideoDeviceType type, int32_t selection, uint
         video_thread_paused = false;
     } else { /* vdt_output */
 
-        /* Create X11 window associated to device */
-        if ((device->x_display = XOpenDisplay(NULL)) == NULL) {
+        if (!video_window_open(device, vdt_output, "Video Receive")) {
             close_video_device(vdt_output, temp_idx);
             unlock;
             return vde_FailedStart;
         }
-
-        int screen = DefaultScreen(device->x_display);
-
-        if (!(device->x_window = XCreateSimpleWindow(device->x_display, RootWindow(device->x_display, screen), 0, 0,
-                                 100, 100, 0, BlackPixel(device->x_display, screen), BlackPixel(device->x_display, screen)))) {
-            close_video_device(vdt_output, temp_idx);
-            unlock;
-            return vde_FailedStart;
-        }
-
-        XStoreName(device->x_display, device->x_window, "Video Receive");
-        XSelectInput(device->x_display, device->x_window, ExposureMask | ButtonPressMask | KeyPressMask);
-
-        if ((device->x_gc = DefaultGC(device->x_display, screen)) == NULL) {
-            close_video_device(vdt_output, temp_idx);
-            unlock;
-            return vde_FailedStart;
-        }
-
-        /* Disable user from manually closing the X11 window */
-        Atom wm_delete_window = XInternAtom(device->x_display, "WM_DELETE_WINDOW", false);
-        XSetWMProtocols(device->x_display, device->x_window, &wm_delete_window, 1);
-
-        XMapWindow(device->x_display, device->x_window);
-        XClearWindow(device->x_display, device->x_window);
-        XMapRaised(device->x_display, device->x_window);
-        XFlush(device->x_display);
 
         vpx_img_alloc(&device->input, VPX_IMG_FMT_I420, device->video_width, device->video_height, 1);
     }
@@ -604,17 +692,21 @@ VideoDeviceError write_video_out(uint16_t width, uint16_t height,
         return vde_DeviceNotActive;
     }
 
+#ifdef USE_X11
+
     if (!device->x_window) {
         return vde_DeviceNotActive;
     }
 
+#endif /* USE_X11 */
+
     pthread_mutex_lock(device->mutex);
 
-    /* Resize X11 window to correct size */
+    /* Resize window to correct size */
     if (device->video_width != width || device->video_height != height) {
         device->video_width = width;
         device->video_height = height;
-        XResizeWindow(device->x_display, device->x_window, width, height);
+        video_window_resize(device, width, height);
 
         vpx_img_free(&device->input);
         vpx_img_alloc(&device->input, VPX_IMG_FMT_I420, width, height, 1);
@@ -626,30 +718,7 @@ VideoDeviceError write_video_out(uint16_t width, uint16_t height,
     vstride = abs(vstride);
     uint8_t *img_data = malloc(width * height * 4);
     yuv420tobgr(width, height, y, u, v, ystride, ustride, vstride, img_data);
-
-    /* Allocate image data in X11 */
-    XImage image = {
-        .width = width,
-        .height = height,
-        .depth = 24,
-        .bits_per_pixel = 32,
-        .format = ZPixmap,
-        .byte_order = LSBFirst,
-        .bitmap_unit = 8,
-        .bitmap_bit_order = LSBFirst,
-        .bytes_per_line = width * 4,
-        .red_mask = 0xFF0000,
-        .green_mask = 0xFF00,
-        .blue_mask = 0xFF,
-        .data = (char *)img_data
-    };
-
-    /* Render image data */
-    Pixmap pixmap = XCreatePixmap(device->x_display, device->x_window, width, height, 24);
-    XPutImage(device->x_display, pixmap, device->x_gc, &image, 0, 0, 0, 0, width, height);
-    XCopyArea(device->x_display, pixmap, device->x_window, device->x_gc, 0, 0, width, height, 0, 0);
-    XFreePixmap(device->x_display, pixmap);
-    XFlush(device->x_display);
+    video_window_draw(device, vdt_output, img_data, width, height);
     free(img_data);
 
     pthread_mutex_unlock(device->mutex);
@@ -694,14 +763,14 @@ void *video_thread_poll(void *userdata)  // TODO: maybe use thread for every inp
                     uint8_t *u = device->input.planes[1];
                     uint8_t *v = device->input.planes[2];
 
-#if defined(__OSX__) || defined(__APPLE__)
+#ifndef USE_V4L2
 
-                    if (osx_video_read_device(y, u, v, &video_width, &video_height) != 0) {
+                    if (camera_read(y, u, v, &video_width, &video_height) != 0) {
                         unlock;
                         continue;
                     }
 
-#else /* not __OSX__ || __APPLE__ */
+#else /* USE_V4L2 */
                     struct v4l2_buffer buf = {0};
 
                     buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -728,33 +797,10 @@ void *video_thread_poll(void *userdata)  // TODO: maybe use thread for every inp
                     uint8_t *img_data = malloc(video_width * video_height * 4);
                     yuv420tobgr(video_width, video_height, y, u, v,
                                 video_width, video_width / 2, video_width / 2, img_data);
-
-                    /* Allocate image data in X11 */
-                    XImage image = {
-                        .width = video_width,
-                        .height = video_height,
-                        .depth = 24,
-                        .bits_per_pixel = 32,
-                        .format = ZPixmap,
-                        .byte_order = LSBFirst,
-                        .bitmap_unit = 8,
-                        .bitmap_bit_order = LSBFirst,
-                        .bytes_per_line = video_width * 4,
-                        .red_mask = 0xFF0000,
-                        .green_mask = 0xFF00,
-                        .blue_mask = 0xFF,
-                        .data = (char *)img_data
-                    };
-
-                    /* Render image data */
-                    Pixmap pixmap = XCreatePixmap(device->x_display, device->x_window, video_width, video_height, 24);
-                    XPutImage(device->x_display, pixmap, device->x_gc, &image, 0, 0, 0, 0, video_width, video_height);
-                    XCopyArea(device->x_display, pixmap, device->x_window, device->x_gc, 0, 0, video_width, video_height, 0, 0);
-                    XFreePixmap(device->x_display, pixmap);
-                    XFlush(device->x_display);
+                    video_window_draw(device, vdt_input, img_data, video_width, video_height);
                     free(img_data);
 
-#if !(defined(__OSX__) || defined(__APPLE__))
+#ifdef USE_V4L2
 
                     if (-1 == xioctl(device->fd, VIDIOC_QBUF, &buf)) {
                         unlock;
@@ -796,10 +842,10 @@ VideoDeviceError close_video_device(VideoDeviceType type, uint32_t device_idx)
     if (!device->ref_count) {
 
         if (type == vdt_input) {
-#if defined(__OSX__) || defined(__APPLE__)
+#ifndef USE_V4L2
 
-            osx_video_close_device(device_idx);
-#else /* not __OSX__ || __APPLE__ */
+            camera_close(device_idx);
+#else /* USE_V4L2 */
             enum v4l2_buf_type buf_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
             if (-1 == xioctl(device->fd, VIDIOC_STREAMOFF, &buf_type)) {}
@@ -815,21 +861,17 @@ VideoDeviceError close_video_device(VideoDeviceType type, uint32_t device_idx)
 
 #endif
             vpx_img_free(&device->input);
-            XDestroyWindow(device->x_display, device->x_window);
-            XFlush(device->x_display);
-            XCloseDisplay(device->x_display);
+            video_window_close(device, vdt_input);
             pthread_mutex_destroy(device->mutex);
 
-#if !(defined(__OSX__) || defined(__APPLE__))
+#ifdef USE_V4L2
             free(device->buffers);
-#endif /* not __OSX__ || __APPLE__ */
+#endif /* USE_V4L2 */
 
             free(device);
         } else {
             vpx_img_free(&device->input);
-            XDestroyWindow(device->x_display, device->x_window);
-            XFlush(device->x_display);
-            XCloseDisplay(device->x_display);
+            video_window_close(device, vdt_output);
             pthread_mutex_destroy(device->mutex);
             free(device);
         }

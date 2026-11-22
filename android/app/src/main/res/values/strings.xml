@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Toxic</string>
+    <string name="running">Online while Toxic runs</string>
+    <string name="running_channel">Running</string>
+</resources>

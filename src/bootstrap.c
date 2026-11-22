@@ -194,12 +194,20 @@ static int curl_fetch_nodes_JSON(const Run_Options *run_opts, struct Recv_Curl_D
     }
 
     int err = -1;
+    char curl_error[CURL_ERROR_SIZE] = "";
 
     struct curl_slist *headers = NULL;
     headers = curl_slist_append(headers, "Content-Type: application/json");
     headers = curl_slist_append(headers, "charsets: utf-8");
 
-    int ret = curl_easy_setopt(c_handle, CURLOPT_HTTPHEADER, headers);
+    int ret = curl_easy_setopt(c_handle, CURLOPT_ERRORBUFFER, curl_error);
+
+    if (ret != CURLE_OK) {
+        fprintf(stderr, "Failed to set error buffer (libcurl error %d)", ret);
+        goto on_exit;
+    }
+
+    ret = curl_easy_setopt(c_handle, CURLOPT_HTTPHEADER, headers);
 
     if (ret != CURLE_OK) {
         fprintf(stderr, "Failed to set http headers (libcurl error %d)", ret);
@@ -282,7 +290,8 @@ static int curl_fetch_nodes_JSON(const Run_Options *run_opts, struct Recv_Curl_D
         }
 
         if (ret != CURLE_OK) {
-            fprintf(stderr, "HTTPS lookup error (libcurl error %d)\n", ret);
+            fprintf(stderr, "HTTPS lookup error (libcurl error %d: %s)\n", ret,
+                    curl_error[0] != '\0' ? curl_error : curl_easy_strerror(ret));
             goto on_exit;
         }
     }

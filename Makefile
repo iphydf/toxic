@@ -49,6 +49,9 @@ endif
 ifeq ($(UNAME_S), Darwin)
     -include $(CFG_DIR)/systems/Darwin.mk
 endif
+ifeq ($(UNAME_S), Android)
+    -include $(CFG_DIR)/systems/Android.mk
+endif
 
 # Check on which platform we are running
 UNAME_M = $(shell uname -m)

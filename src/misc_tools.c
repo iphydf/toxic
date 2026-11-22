@@ -307,6 +307,15 @@ static int qsort_r_compar_apple(void *thunk, const void *a, const void *b)
     return data->compar(a, b, data->arg);
 }
 
+#elif defined(__ANDROID__)
+/* Android's libc has no qsort_r, so we pass the comparison's argument through this. */
+static _Thread_local struct qsort_r_data qsort_r_current;
+
+static int qsort_r_compar_android(const void *a, const void *b)
+{
+    return qsort_r_current.compar(a, b, qsort_r_current.arg);
+}
+
 #endif
 
 void toxic_qsort_r(void *base, size_t nmemb, size_t size,
@@ -316,6 +325,11 @@ void toxic_qsort_r(void *base, size_t nmemb, size_t size,
 #if defined(__APPLE__)
     struct qsort_r_data data = { arg, compar };
     qsort_r(base, nmemb, size, &data, qsort_r_compar_apple);
+#elif defined(__ANDROID__)
+    const struct qsort_r_data outer = qsort_r_current;
+    qsort_r_current = (struct qsort_r_data) { arg, compar };
+    qsort(base, nmemb, size, qsort_r_compar_android);
+    qsort_r_current = outer;
 #else
     qsort_r(base, nmemb, size, compar, arg);
 #endif

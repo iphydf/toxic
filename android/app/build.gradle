@@ -1,0 +1,46 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+// The native library comes from ../build-native.sh, into src/main/jniLibs.
+
+// The settings screen is built from toxic's example config.
+def configExampleDir = layout.buildDirectory.dir('generated/configExample')
+def configExample = tasks.register('configExample', Copy) {
+    from '../../misc/toxic.conf.example'
+    into configExampleDir
+}
+tasks.named('preBuild') {
+    dependsOn configExample
+}
+
+android {
+    namespace 'chat.tox.toxic'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'chat.tox.toxic'
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName '0.16.3'
+    }
+
+    sourceSets {
+        main {
+            assets.srcDir(configExampleDir)
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+}
